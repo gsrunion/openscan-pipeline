@@ -4,8 +4,4 @@ __pycache__/
 dist/
 build/
 .venv/
-*.tif
-*.tiff
-*.png
-*.raw
-*.dng
+data/
