@@ -1,0 +1,14 @@
+[project]
+name = "openscan-pipeline"
+version = "0.1.0"
+description = "Workstation-side processing pipeline for OpenScan photogrammetry captures"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "opencv-python>=4.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
