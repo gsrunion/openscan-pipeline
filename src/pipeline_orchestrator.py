@@ -1,58 +1,59 @@
 """
-pipeline_orchestrator.py — Pipelined capture + transfer + processing.
+pipeline_orchestrator.py — Firmware-API scan pipeline.
 
-Runs the full photogrammetry pipeline with maximum overlap:
-- Captures one position at a time on the Pi (via SSH)
-- Transfers files immediately after each position completes
-- Demosaics in parallel on the workstation as files arrive
-- Enfuse blends each bracket as soon as all its frames are demosaiced
+Drives the OpenScan turntable via the OpenScan3 firmware REST API, capturing
+grayscale JPEG images for COLMAP reconstruction. No raw files, no demosaic,
+no Enfuse — just fast, lean captures over HTTP.
+
+Requires the OpenScan3 firmware (with PR #67 quality gate) running on the Pi.
+
+Pipeline per position:
+    1. PUT /motors/{turntable}/angle  — move turntable (blocks until done)
+    2. PUT /motors/{rotor}/angle      — move rotor arm (blocks until done)
+    3. GET /cameras/{camera}/photo    — capture JPEG (quality gate in firmware)
+    4. Convert to grayscale + downscale on workstation
+    5. Save JPEG + pose sidecar JSON
 
 Usage:
-    python pipeline_orchestrator.py \
-        --pi pi@192.168.4.202 \
-        --pi-key ~/.ssh/id_ed25519 \
-        --session test_scan_002 \
-        --elevations 0 80 \
-        --azimuths 0 45 90 135 180 225 270 315 \
-        --workers 8
+    python pipeline_orchestrator.py \\
+        --firmware-url http://192.168.4.202:8000 \\
+        --session my_scan \\
+        --elevations 0 45 80 \\
+        --azimuths $(seq 0 45 315)
 """
 
 import argparse
 import json
 import logging
-import os
-import re
-import subprocess
 import time
-from concurrent.futures import ProcessPoolExecutor, Future
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import requests
+
 logger = logging.getLogger(__name__)
 
-# Quality gate threshold (Laplacian variance on preview frame)
-# Pi-side gate runs on preview resolution (1152x868), much faster than raw.
-# Calibrated from Phase A acceptance tests: sharp frames score 30-90,
-# minimum acceptable = 20. Truly bad frames (motion blur, defocus) score <10.
-QUALITY_GATE_MIN = 20
-MAX_RECAPTURE_TRIES = 2
-
-# Default paths
-PI_SCAN_DIR = "~/scan"
-PI_CAPTURE_SCRIPT = "~/photoscan/src/focus_bracket_driver.py"
-WORKSTATION_BASE = Path.home() / "photogrammetry"
+# Request timeouts (seconds)
+MOTOR_TIMEOUT = 120   # motor moves block until done; allow generous timeout
+CAPTURE_TIMEOUT = 60  # photo capture
 
 
 @dataclass
 class PipelineConfig:
-    pi_host: str = "pi@192.168.4.202"
-    pi_key: str = str(Path.home() / ".ssh" / "id_ed25519")
+    firmware_url: str = "http://192.168.4.202:8000"
+    api_version: str = "latest"
+    turntable_motor: str = "turntable"
+    rotor_motor: str = "rotor"
+    camera_name: str = "arducam_64mp"
     session: str = "scan_001"
-    elevations: list[float] = field(default_factory=lambda: [0.0, 80.0])
+    elevations: list[float] = field(default_factory=lambda: [0.0, 45.0, 80.0])
     azimuths: list[float] = field(default_factory=lambda: [float(a) for a in range(0, 360, 45)])
-    workers: int = 8
-    output_base: Path = field(default_factory=lambda: WORKSTATION_BASE)
+    output_base: Path = field(default_factory=lambda: Path.home() / "photogrammetry")
+
+    @property
+    def base_url(self) -> str:
+        return f"{self.firmware_url}/{self.api_version}"
 
     @property
     def positions(self) -> list[dict]:
@@ -67,377 +68,188 @@ class PipelineConfig:
         return self.output_base / self.session
 
     @property
-    def raw_dir(self) -> Path:
-        return self.session_dir / "raw"
-
-    @property
-    def demosaiced_dir(self) -> Path:
-        return self.session_dir / "demosaiced"
-
-    @property
-    def stacked_dir(self) -> Path:
-        return self.session_dir / "stacked"
-
-    @property
-    def pi_raw_dir(self) -> str:
-        return f"{PI_SCAN_DIR}/{self.session}/raw"
+    def images_dir(self) -> Path:
+        return self.session_dir / "images"
 
 
 # ---------------------------------------------------------------------------
-# SSH + rsync helpers
+# Firmware API calls
 # ---------------------------------------------------------------------------
 
-def ssh_cmd(cfg: PipelineConfig, command: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Run a command on the Pi via SSH."""
-    cmd = [
-        "ssh", "-i", cfg.pi_key,
-        "-o", "StrictHostKeyChecking=accept-new",
-        cfg.pi_host,
-        command,
-    ]
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+def _put(url: str, timeout: int = MOTOR_TIMEOUT, **kwargs) -> requests.Response:
+    resp = requests.put(url, timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp
 
 
-def rsync_position(cfg: PipelineConfig, prefix: str) -> list[Path]:
-    """Rsync all files for a given position prefix from Pi to workstation."""
-    cfg.raw_dir.mkdir(parents=True, exist_ok=True)
-
-    # Transfer raw + json files matching this position
-    cmd = [
-        "rsync", "-avz",
-        "--include", f"{prefix}_f*",
-        "--exclude", "*",
-        f"{cfg.pi_host}:{cfg.pi_raw_dir}/",
-        f"{str(cfg.raw_dir)}/",
-        "-e", f"ssh -i {cfg.pi_key}",
-    ]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-    if result.returncode != 0:
-        logger.error("rsync failed for %s: %s", prefix, result.stderr[:300])
-        return []
-
-    # Return list of transferred raw files
-    transferred = sorted(cfg.raw_dir.glob(f"{prefix}_f*.raw"))
-    return transferred
+def _get(url: str, timeout: int = CAPTURE_TIMEOUT, **kwargs) -> requests.Response:
+    resp = requests.get(url, timeout=timeout, **kwargs)
+    resp.raise_for_status()
+    return resp
 
 
-# ---------------------------------------------------------------------------
-# Pi-side capture with quality gate and recapture
-# ---------------------------------------------------------------------------
+def check_firmware(cfg: PipelineConfig) -> dict:
+    """Verify firmware is reachable. Returns firmware info dict."""
+    resp = _get(f"{cfg.base_url}/", timeout=10)
+    return resp.json()
 
-def capture_position_with_gate(cfg: PipelineConfig, az: float, el: float) -> subprocess.CompletedProcess:
-    """Capture a bracket on the Pi with per-frame quality gate and auto-recapture.
 
-    The Pi-side script:
-    1. Moves to position
-    2. Captures each focus bracket frame
-    3. Checks Laplacian variance on preview after each frame
-    4. If a frame fails, recaptures it (up to MAX_RECAPTURE_TRIES)
-    5. Returns JSON summary with per-frame scores
+def move_motor(cfg: PipelineConfig, motor_name: str, degrees: float):
+    """Move a motor to an absolute angle. Blocks until the move completes."""
+    url = f"{cfg.base_url}/motors/{motor_name}/angle"
+    _put(url, params={"degrees": degrees}, timeout=MOTOR_TIMEOUT)
+    logger.debug("Motor %s → %.1f°", motor_name, degrees)
+
+
+def capture_photo(cfg: PipelineConfig) -> bytes:
+    """Capture a grayscale JPEG from the firmware camera endpoint.
+
+    Grayscale conversion happens on the Pi before transfer, minimising
+    network payload (≈3× smaller than colour JPEG at the same resolution).
     """
-    cap_cmd = f"""cd ~/photoscan/src && python3 -c "
-import json, sys, time
-sys.path.insert(0, '.')
-from focus_bracket_driver import FocusBracketDriver, laplacian_variance
+    url = f"{cfg.base_url}/cameras/{cfg.camera_name}/photo"
+    resp = _get(url, params={"grayscale": "true"}, timeout=CAPTURE_TIMEOUT)
+    return resp.content
 
-GATE_MIN = {QUALITY_GATE_MIN}
-MAX_RETRIES = {MAX_RECAPTURE_TRIES}
 
-with FocusBracketDriver() as driver:
-    paths = driver.capture_position(
-        azimuth={az}, elevation={el},
-        output_dir='{cfg.pi_raw_dir}',
-    )
-    # Quality gate: check each frame via preview sharpness
-    # The capture_position method already applies quality gates internally
-    # (QUALITY_GATE_MIN and MAX_RECAPTURE_TRIES in focus_bracket_driver.py)
-    print(json.dumps({{'frames': len(paths), 'status': 'ok'}}))
-"
-"""
-    return ssh_cmd(cfg, cap_cmd, timeout=180)
+def move_to_position(cfg: PipelineConfig, azimuth: float, elevation: float):
+    """Move both motors to the target position."""
+    # Move in parallel via threads would be cleaner, but sequential is simpler
+    # and the firmware handles each move as a blocking call anyway.
+    move_motor(cfg, cfg.turntable_motor, azimuth)
+    move_motor(cfg, cfg.rotor_motor, elevation)
 
 
 # ---------------------------------------------------------------------------
-# Per-file demosaicing (runs in worker pool)
+# Image processing
 # ---------------------------------------------------------------------------
 
-def demosaic_single_file(raw_path_str: str, output_dir_str: str) -> dict:
-    """Demosaic one raw file. Designed to run in a separate process."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).parent))
-    from demosaic import demosaic_raw_file
 
-    raw_path = Path(raw_path_str)
-    output_dir = Path(output_dir_str)
-    t0 = time.perf_counter()
 
-    sidecar = raw_path.with_suffix(".json")
-    sidecar = sidecar if sidecar.exists() else None
+def save_image(path: Path, jpeg_bytes: bytes):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(jpeg_bytes)
 
-    output_path = demosaic_raw_file(raw_path, sidecar, output_dir)
-    elapsed = time.perf_counter() - t0
 
-    return {
-        "input": raw_path.name,
-        "output": str(output_path),
-        "elapsed_s": round(elapsed, 2),
+def save_sidecar(path: Path, azimuth: float, elevation: float, extra: dict = None):
+    """Save a minimal pose sidecar JSON alongside the image."""
+    data = {
+        "azimuth_deg": azimuth,
+        "elevation_deg": elevation,
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if extra:
+        data.update(extra)
+    path.with_suffix(".json").write_text(json.dumps(data, indent=2))
 
 
 # ---------------------------------------------------------------------------
-# Enfuse blending (runs in worker pool)
-# ---------------------------------------------------------------------------
-
-def enfuse_bracket(bracket_key: str, file_paths_str: list[str], output_dir_str: str) -> dict:
-    """Run Enfuse on one bracket. Designed to run in a separate process."""
-    output_dir = Path(output_dir_str)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{bracket_key}_stacked.tif"
-
-    t0 = time.perf_counter()
-
-    cmd = [
-        "enfuse",
-        "--output", str(output_path),
-        "--hard-mask",
-        "--exposure-weight=0",
-        "--saturation-weight=0",
-        "--contrast-weight=1",
-        "--contrast-edge-scale=0.3",
-    ] + sorted(file_paths_str)
-
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-    elapsed = time.perf_counter() - t0
-
-    if result.returncode != 0:
-        raise RuntimeError(f"Enfuse failed for {bracket_key}: {result.stderr[:300]}")
-
-    return {
-        "bracket": bracket_key,
-        "output": str(output_path),
-        "n_frames": len(file_paths_str),
-        "elapsed_s": round(elapsed, 2),
-    }
-
-
-# ---------------------------------------------------------------------------
-# Main pipeline orchestrator
+# Main pipeline
 # ---------------------------------------------------------------------------
 
 def run_pipeline(cfg: PipelineConfig):
-    """
-    Pipelined execution:
-    1. For each position: capture on Pi → rsync to workstation → submit demosaic
-    2. When all frames for a bracket are demosaiced → submit Enfuse
-    3. Everything overlaps as much as possible.
-    """
+    cfg.images_dir.mkdir(parents=True, exist_ok=True)
+
     positions = cfg.positions
     total = len(positions)
 
-    # Create output directories
-    for d in [cfg.raw_dir, cfg.demosaiced_dir, cfg.stacked_dir]:
-        d.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Pipeline starting: %d positions, %d workers", total, cfg.workers)
-    logger.info("  Pi: %s", cfg.pi_host)
-    logger.info("  Session: %s", cfg.session)
-    logger.info("  Output: %s", cfg.session_dir)
-
-    # Verify Pi connectivity
-    result = ssh_cmd(cfg, "echo ok")
-    if result.returncode != 0:
-        logger.error("Cannot reach Pi: %s", result.stderr[:200])
+    # Verify firmware
+    logger.info("Connecting to firmware at %s ...", cfg.base_url)
+    try:
+        info = check_firmware(cfg)
+        logger.info("Firmware: %s (model: %s)", info.get("firmware_version"), info.get("model"))
+    except Exception as e:
+        logger.error("Cannot reach firmware: %s", e)
+        logger.error("Is the OpenScan3 firmware running on the Pi?")
         return
 
-    # Ensure Pi scan directory exists
-    ssh_cmd(cfg, f"mkdir -p {cfg.pi_raw_dir}")
+    logger.info("Scan: %d positions, session '%s'", total, cfg.session)
+    logger.info("Output: %s", cfg.images_dir)
 
-    pipeline_start = time.perf_counter()
+    stats = {"ok": 0, "failed": 0, "capture_s": 0.0, "move_s": 0.0}
+    t_pipeline = time.perf_counter()
 
-    # Track pending demosaic futures per bracket
-    # bracket_key -> list of futures
-    bracket_demosaic_futures: dict[str, list[Future]] = {}
-    enfuse_futures: list[Future] = []
+    for i, pos in enumerate(positions):
+        az = pos["azimuth"]
+        el = pos["elevation"]
+        prefix = f"scan_az{az:06.2f}_el{el:06.2f}"
+        image_path = cfg.images_dir / f"{prefix}.jpg"
 
-    stats = {
-        "capture_s": 0.0,
-        "transfer_s": 0.0,
-        "positions_ok": 0,
-        "positions_failed": 0,
-        "frames_passed": 0,
-        "frames_rejected": 0,
-    }
+        logger.info("[%d/%d] az=%.1f° el=%.1f°", i + 1, total, az, el)
 
-    with ProcessPoolExecutor(max_workers=cfg.workers) as pool:
-        for i, pos in enumerate(positions):
-            az = pos["azimuth"]
-            el = pos["elevation"]
-            prefix = f"scan_az{az:06.2f}_el{el:06.2f}"
+        # Move motors
+        t0 = time.perf_counter()
+        try:
+            move_to_position(cfg, az, el)
+        except Exception as e:
+            logger.error("  Motor move failed: %s", e)
+            stats["failed"] += 1
+            continue
+        move_elapsed = time.perf_counter() - t0
+        stats["move_s"] += move_elapsed
+        logger.info("  Moved in %.1fs", move_elapsed)
 
-            logger.info("[%d/%d] Position: az=%.1f el=%.1f", i + 1, total, az, el)
+        # Capture
+        t0 = time.perf_counter()
+        try:
+            raw_jpeg = capture_photo(cfg)
+        except Exception as e:
+            logger.error("  Capture failed: %s", e)
+            stats["failed"] += 1
+            continue
+        cap_elapsed = time.perf_counter() - t0
+        stats["capture_s"] += cap_elapsed
+        logger.info("  Captured in %.1fs (%d KB)", cap_elapsed, len(raw_jpeg) // 1024)
 
-            # --- STAGE 1: Capture on Pi (with built-in quality gate + recapture) ---
-            t_cap = time.perf_counter()
-            cap_result = capture_position_with_gate(cfg, az, el)
-            cap_elapsed = time.perf_counter() - t_cap
-            stats["capture_s"] += cap_elapsed
+        # Save
+        try:
+            save_image(image_path, raw_jpeg)
+            save_sidecar(image_path, az, el)
+        except Exception as e:
+            logger.error("  Save failed: %s", e)
+            stats["failed"] += 1
+            continue
 
-            if cap_result.returncode != 0:
-                logger.error("  Capture FAILED: %s", cap_result.stderr[:200])
-                stats["positions_failed"] += 1
-                continue
+        stats["ok"] += 1
+        logger.info("  Saved: %s (%d KB)", image_path.name, len(raw_jpeg) // 1024)
 
-            logger.info("  Captured in %.1fs", cap_elapsed)
-
-            # --- STAGE 2: Transfer to workstation ---
-            t_xfer = time.perf_counter()
-            raw_files = rsync_position(cfg, prefix)
-            xfer_elapsed = time.perf_counter() - t_xfer
-            stats["transfer_s"] += xfer_elapsed
-
-            if not raw_files:
-                logger.error("  Transfer returned no files for %s", prefix)
-                stats["positions_failed"] += 1
-                continue
-
-            logger.info("  Transferred %d files in %.1fs", len(raw_files), xfer_elapsed)
-            stats["positions_ok"] += 1
-
-            # --- STAGE 3: Submit demosaic jobs (frames already quality-gated on Pi) ---
-            futures = []
-            for raw_file in raw_files:
-                f = pool.submit(
-                    demosaic_single_file,
-                    str(raw_file),
-                    str(cfg.demosaiced_dir),
-                )
-                futures.append(f)
-            stats["frames_passed"] += len(raw_files)
-
-            bracket_demosaic_futures[prefix] = futures
-
-            # --- Check if any brackets are fully demosaiced → submit Enfuse ---
-            _check_and_submit_enfuse(
-                bracket_demosaic_futures, enfuse_futures,
-                pool, cfg,
-            )
-
-        # --- Wait for remaining demosaic jobs and submit final Enfuse batches ---
-        logger.info("Capture phase complete. Waiting for remaining processing...")
-
-        # Poll until all demosaic futures are done
-        while any(
-            not all(f.done() for f in futs)
-            for futs in bracket_demosaic_futures.values()
-        ):
-            _check_and_submit_enfuse(
-                bracket_demosaic_futures, enfuse_futures,
-                pool, cfg,
-            )
-            time.sleep(1)
-
-        # Final check for any remaining brackets
-        _check_and_submit_enfuse(
-            bracket_demosaic_futures, enfuse_futures,
-            pool, cfg,
-        )
-
-        # Wait for all Enfuse jobs
-        for f in enfuse_futures:
-            try:
-                result = f.result(timeout=300)
-                logger.info("  Enfuse done: %s (%d frames, %.1fs)",
-                           result["bracket"], result["n_frames"], result["elapsed_s"])
-            except Exception as e:
-                logger.error("  Enfuse failed: %s", e)
-
-    pipeline_elapsed = time.perf_counter() - pipeline_start
-
-    # --- Summary ---
-    stacked_count = len(list(cfg.stacked_dir.glob("*_stacked.tif")))
-    demosaiced_count = len(list(cfg.demosaiced_dir.glob("*_demosaiced.tif")))
-    raw_count = len(list(cfg.raw_dir.glob("*.raw")))
+    total_elapsed = time.perf_counter() - t_pipeline
+    image_count = len(list(cfg.images_dir.glob("*.jpg")))
 
     logger.info("")
-    logger.info("=" * 60)
-    logger.info("PIPELINE COMPLETE")
-    logger.info("=" * 60)
+    logger.info("=" * 55)
+    logger.info("SCAN COMPLETE")
+    logger.info("=" * 55)
     logger.info("  Positions:    %d OK / %d failed / %d total",
-                stats["positions_ok"], stats["positions_failed"], total)
-    logger.info("  Frames:       %d passed Pi quality gate",
-                stats["frames_passed"])
-    logger.info("  Raw files:    %d", raw_count)
-    logger.info("  Demosaiced:   %d", demosaiced_count)
-    logger.info("  Stacked:      %d", stacked_count)
-    logger.info("  Capture time: %.1fs (%.1fs avg/position)",
+                stats["ok"], stats["failed"], total)
+    logger.info("  Images saved: %d  (%s)",
+                image_count, cfg.images_dir)
+    logger.info("  Move time:    %.1fs total (%.1fs avg)",
+                stats["move_s"], stats["move_s"] / max(total, 1))
+    logger.info("  Capture time: %.1fs total (%.1fs avg)",
                 stats["capture_s"], stats["capture_s"] / max(total, 1))
-    logger.info("  Transfer time: %.1fs (%.1fs avg/position)",
-                stats["transfer_s"], stats["transfer_s"] / max(total, 1))
-    logger.info("  Total wall time: %.1fs (%.1f min)",
-                pipeline_elapsed, pipeline_elapsed / 60)
+    logger.info("  Wall time:    %.1fs (%.1f min)",
+                total_elapsed, total_elapsed / 60)
 
-    # Save summary
     summary = {
         "session": cfg.session,
         "positions_total": total,
-        "positions_ok": stats["positions_ok"],
-        "positions_failed": stats["positions_failed"],
-        "frames_passed": stats["frames_passed"],
-        "raw_files": raw_count,
-        "demosaiced_files": demosaiced_count,
-        "stacked_files": stacked_count,
+        "positions_ok": stats["ok"],
+        "positions_failed": stats["failed"],
+        "images": image_count,
+        "move_time_s": round(stats["move_s"], 1),
         "capture_time_s": round(stats["capture_s"], 1),
-        "transfer_time_s": round(stats["transfer_s"], 1),
-        "total_wall_time_s": round(pipeline_elapsed, 1),
+        "total_wall_time_s": round(total_elapsed, 1),
     }
-    summary_path = cfg.session_dir / "pipeline_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2))
-    logger.info("  Summary: %s", summary_path)
+    (cfg.session_dir / "scan_summary.json").write_text(json.dumps(summary, indent=2))
 
-
-# Track which brackets have already been submitted for Enfuse
-_enfuse_submitted: set[str] = set()
-
-
-def _check_and_submit_enfuse(
-    bracket_futures: dict[str, list[Future]],
-    enfuse_futures: list[Future],
-    pool: ProcessPoolExecutor,
-    cfg: PipelineConfig,
-):
-    """Check if any brackets have all demosaic jobs done, submit Enfuse."""
-    for bracket_key, futures in bracket_futures.items():
-        if bracket_key in _enfuse_submitted:
-            continue
-        if not all(f.done() for f in futures):
-            continue
-
-        # All demosaic jobs for this bracket are done — collect output paths
-        demosaiced_paths = []
-        all_ok = True
-        for f in futures:
-            try:
-                result = f.result()
-                demosaiced_paths.append(result["output"])
-            except Exception as e:
-                logger.error("  Demosaic failed in bracket %s: %s", bracket_key, e)
-                all_ok = False
-
-        if not all_ok or len(demosaiced_paths) < 2:
-            logger.warning("  Skipping Enfuse for %s (incomplete demosaic)", bracket_key)
-            _enfuse_submitted.add(bracket_key)
-            continue
-
-        # Submit Enfuse job
-        logger.info("  Submitting Enfuse for %s (%d frames)", bracket_key, len(demosaiced_paths))
-        ef = pool.submit(
-            enfuse_bracket,
-            bracket_key,
-            demosaiced_paths,
-            str(cfg.stacked_dir),
-        )
-        enfuse_futures.append(ef)
-        _enfuse_submitted.add(bracket_key)
+    if stats["ok"] > 0:
+        logger.info("")
+        logger.info("Next step — run reconstruction:")
+        logger.info("  python src/colmap_reconstruct.py \\")
+        logger.info("    --images %s \\", cfg.images_dir)
+        logger.info("    --output %s/colmap \\", cfg.session_dir)
+        logger.info("    --calibration data/calibration/calibration.json")
 
 
 # ---------------------------------------------------------------------------
@@ -446,25 +258,30 @@ def _check_and_submit_enfuse(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Pipelined photogrammetry: capture → transfer → demosaic → enfuse"
+        description="OpenScan firmware-API scan pipeline → grayscale JPEG → COLMAP"
     )
-    parser.add_argument("--pi", default="pi@192.168.4.202",
-                       help="Pi SSH target (default: pi@192.168.4.202)")
-    parser.add_argument("--pi-key", default=str(Path.home() / ".ssh" / "id_ed25519"),
-                       help="SSH key path")
+    parser.add_argument("--firmware-url", default="http://192.168.4.202:8000",
+                        help="OpenScan3 firmware base URL")
+    parser.add_argument("--api-version", default="latest",
+                        help="API version prefix (default: latest)")
+    parser.add_argument("--turntable-motor", default="turntable",
+                        help="Turntable motor name in firmware config")
+    parser.add_argument("--rotor-motor", default="rotor",
+                        help="Rotor/tilt arm motor name in firmware config")
+    parser.add_argument("--camera", default="arducam_64mp",
+                        help="Camera name in firmware config")
     parser.add_argument("--session", default="scan_001",
-                       help="Session name (determines output directory)")
-    parser.add_argument("--elevations", nargs="+", type=float, default=[0.0, 80.0],
-                       help="Elevation angles (default: 0 80)")
+                        help="Session name (output directory)")
+    parser.add_argument("--elevations", nargs="+", type=float, default=[0.0, 45.0, 80.0],
+                        help="Elevation angles in degrees")
     parser.add_argument("--azimuths", nargs="+", type=float,
-                       default=[float(a) for a in range(0, 360, 45)],
-                       help="Azimuth angles (default: 0 45 90 ... 315)")
-    parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4),
-                       help="Parallel workers (default: 8)")
-    parser.add_argument("--output-base", type=Path, default=WORKSTATION_BASE,
-                       help="Base output directory")
+                        default=[float(a) for a in range(0, 360, 45)],
+                        help="Azimuth angles in degrees")
+    parser.add_argument("--output-base", type=Path,
+                        default=Path.home() / "photogrammetry",
+                        help="Base output directory")
     parser.add_argument("--log-level", default="INFO",
-                       choices=["DEBUG", "INFO", "WARNING", "ERROR"])
+                        choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -473,12 +290,14 @@ def main():
     )
 
     cfg = PipelineConfig(
-        pi_host=args.pi,
-        pi_key=args.pi_key,
+        firmware_url=args.firmware_url,
+        api_version=args.api_version,
+        turntable_motor=args.turntable_motor,
+        rotor_motor=args.rotor_motor,
+        camera_name=args.camera,
         session=args.session,
         elevations=args.elevations,
         azimuths=args.azimuths,
-        workers=args.workers,
         output_base=args.output_base,
     )
 

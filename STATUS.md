@@ -1,8 +1,8 @@
 # Project Status
 
-**Last updated:** 2026-03-06
+**Last updated:** 2026-03-10
 
-## Current Phase: D — Dense Reconstruction (blocked on hardware)
+## Current Phase: D — Dense Reconstruction (calibration + validation in progress)
 
 ### Phase A: Foundation ✅
 - [x] SSH & passwordless auth to Pi
@@ -30,9 +30,9 @@
 - [x] 16-position test scan (capture → demosaic → blend) ✅
 - [x] COLMAP feature extraction (9.4–10.8k features/image) ✅
 - [x] Feature matching (120 matches found) ✅
-- [ ] **Rotor motor repair** ⛔ — missing plastic gear in elevation gearbox (3D printing replacement)
-- [ ] **Camera calibration** ⛔ — needs checkerboard at 3–5 distances + working rotor
-- [ ] **Pose-prior SfM** — turntable geometry too constrained for vanilla COLMAP; need known camera poses
+- [x] **Rotor motor repair** ✅ — elevation gearbox repaired
+- [ ] **Camera calibration** — unblocked; collect checkerboard set and solve intrinsics
+- [ ] **Pose-prior SfM** — firmware capture + pose-prior COLMAP scripts drafted locally; needs end-to-end validation
 - [ ] Full 120-position scan (5 elevations × 24 azimuths)
 - [ ] OpenMVS dense reconstruction + mesh
 
@@ -46,9 +46,16 @@
 
 | Blocker | Status | Notes |
 |---------|--------|-------|
-| Rotor gear | 3D printing | Missing plastic gear in elevation gearbox |
-| Camera calibration | Blocked on rotor | Needs multiple elevations |
-| Pose-prior SfM | Blocked on calibration | COLMAP fails without pose initialization |
+| Rotor gear | Cleared | Elevation gearbox repaired |
+| Camera calibration | Active next step | Needs checkerboard capture at varied distances/tilts |
+| Pose-prior SfM | Pending validation | New local scripts exist but are not documented/committed yet |
+
+## Immediate Next Steps
+
+1. Improve the checkerboard set until `data/calibration/calibration.json` reaches an acceptable RMS.
+2. Capture a new multi-elevation grayscale JPEG session via the firmware API pipeline.
+3. Run pose-prior COLMAP sparse reconstruction on that session with `--calibration`.
+4. Validate sparse registration quality, then proceed to dense reconstruction.
 
 ## Upstream Contributions
 
