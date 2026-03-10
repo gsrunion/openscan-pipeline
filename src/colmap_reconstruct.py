@@ -26,7 +26,6 @@ import logging
 import re
 import shutil
 import sqlite3
-import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -244,29 +243,25 @@ def get_image_ids(db_path: Path) -> dict[str, int]:
     return result
 
 
-def best_initial_pair(image_poses: dict[str, tuple[float, float]],
-                      image_ids: dict[str, int],
-                      target_angle: float = 60.0) -> tuple[int, int]:
+def ranked_initial_pairs(
+    image_poses: dict[str, tuple[float, float]],
+    image_ids: dict[str, int],
+    target_angles: tuple[float, ...] = (45.0, 60.0, 75.0, 90.0),
+    limit: int = 12,
+) -> list[tuple[int, int]]:
     """
-    Select the initial image pair whose angular separation is closest to
-    target_angle (default 60°). This balances feature overlap (nearby images
-    share more features) against triangulation angle (wider baseline gives
-    better depth recovery).
+    Rank candidate initial image pairs by useful angular separation.
 
     For single-elevation turntable data, 180° pairs see opposite faces of
     the subject and only match background, giving near-zero triangulation
     angle despite many inliers. 45-90° pairs share object features and
     triangulate cleanly.
-
-    Returns (image_id_1, image_id_2).
     """
     names = [n for n in image_poses if n in image_ids]
     if len(names) < 2:
         raise ValueError("Need at least 2 images with known poses and DB IDs")
 
-    best_score = float("inf")
-    best_pair = (image_ids[names[0]], image_ids[names[1]])
-    best_angle = 0.0
+    candidates: list[tuple[float, float, int, int]] = []
 
     for i in range(len(names)):
         for j in range(i + 1, len(names)):
@@ -275,15 +270,13 @@ def best_initial_pair(image_poses: dict[str, tuple[float, float]],
             ci = C_i / np.linalg.norm(C_i)
             cj = C_j / np.linalg.norm(C_j)
             angle = np.degrees(np.arccos(np.clip(np.dot(ci, cj), -1, 1)))
-            score = abs(angle - target_angle)
-            if score < best_score:
-                best_score = score
-                best_angle = angle
-                best_pair = (image_ids[names[i]], image_ids[names[j]])
+            score = min(abs(angle - target) for target in target_angles)
+            candidates.append((score, -angle, image_ids[names[i]], image_ids[names[j]]))
 
-    logger.info("Best initial pair: IDs %d and %d (angular sep %.1f°, target %.1f°)",
-                best_pair[0], best_pair[1], best_angle, target_angle)
-    return best_pair
+    candidates.sort()
+    ranked = [(id1, id2) for _, _, id1, id2 in candidates[:limit]]
+    logger.info("Candidate initial pairs: %s", ranked)
+    return ranked
 
 
 # ---------------------------------------------------------------------------
@@ -337,23 +330,43 @@ def exhaustive_matching(db_path: Path):
     ], "Exhaustive matching")
 
 
-def run_mapper(db_path: Path, image_path: Path, output_path: Path,
-               init_id1: int, init_id2: int):
+def run_mapper(
+    db_path: Path,
+    image_path: Path,
+    output_path: Path,
+    init_id1: int,
+    init_id2: int,
+    init_min_num_inliers: int,
+    init_min_tri_angle: float,
+    abs_pose_min_num_inliers: int,
+) -> bool:
+    if output_path.exists():
+        shutil.rmtree(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
-    run([
+    cmd = [
         "colmap", "mapper",
         "--database_path", str(db_path),
         "--image_path", str(image_path),
         "--output_path", str(output_path),
         "--Mapper.init_image_id1", str(init_id1),
         "--Mapper.init_image_id2", str(init_id2),
-        "--Mapper.abs_pose_min_num_inliers", "10",
+        "--Mapper.abs_pose_min_num_inliers", str(abs_pose_min_num_inliers),
         "--Mapper.abs_pose_min_inlier_ratio", "0.1",
-        "--Mapper.init_min_num_inliers", "10",
-        "--Mapper.init_min_tri_angle", "2.0",
-        "--Mapper.filter_min_tri_angle", "1.0",
+        "--Mapper.init_min_num_inliers", str(init_min_num_inliers),
+        "--Mapper.init_min_tri_angle", str(init_min_tri_angle),
+        "--Mapper.filter_min_tri_angle", "0.5",
         "--Mapper.ba_global_max_num_iterations", "50",
-    ], "Sparse reconstruction (mapper)")
+    ]
+    logger.info(
+        "Running: Sparse reconstruction (mapper), pair=(%d,%d), init_inliers=%d, tri_angle=%.1f",
+        init_id1, init_id2, init_min_num_inliers, init_min_tri_angle,
+    )
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        logger.info("Done: Sparse reconstruction (mapper)")
+        return True
+    logger.warning("Mapper failed for pair (%d,%d): %s", init_id1, init_id2, result.stderr[-1000:])
+    return False
 
 
 def bundle_adjustment(input_path: Path, output_path: Path, image_path: Path,
@@ -455,13 +468,35 @@ def reconstruct(image_dir: Path, output_dir: Path, radius_mm: float,
     image_ids = get_image_ids(db_path)
     inject_pose_priors(db_path, image_poses, radius=radius_mm)
 
-    # 4. Select best initial pair
-    id1, id2 = best_initial_pair(image_poses, image_ids)
-
-    # 5. Sparse reconstruction
-    run_mapper(db_path, image_dir, sparse_dir, id1, id2)
+    # 4. Try several initial pairs with progressively looser startup constraints
+    init_pairs = ranked_initial_pairs(image_poses, image_ids)
+    mapper_succeeded = False
+    mapper_attempts = [
+        {"init_min_num_inliers": 10, "init_min_tri_angle": 2.0, "abs_pose_min_num_inliers": 10},
+        {"init_min_num_inliers": 8, "init_min_tri_angle": 1.0, "abs_pose_min_num_inliers": 8},
+        {"init_min_num_inliers": 6, "init_min_tri_angle": 0.5, "abs_pose_min_num_inliers": 6},
+    ]
+    for id1, id2 in init_pairs:
+        for attempt in mapper_attempts:
+            ok = run_mapper(
+                db_path,
+                image_dir,
+                sparse_dir,
+                id1,
+                id2,
+                init_min_num_inliers=attempt["init_min_num_inliers"],
+                init_min_tri_angle=attempt["init_min_tri_angle"],
+                abs_pose_min_num_inliers=attempt["abs_pose_min_num_inliers"],
+            )
+            if ok:
+                mapper_succeeded = True
+                break
+        if mapper_succeeded:
+            break
 
     # Find the best model (most registered images)
+    if not mapper_succeeded:
+        raise RuntimeError("Mapper produced no models — reconstruction failed")
     models = sorted(sparse_dir.iterdir()) if sparse_dir.exists() else []
     if not models:
         raise RuntimeError("Mapper produced no models — reconstruction failed")

@@ -2,6 +2,22 @@
 
 Workstation-side photogrammetry pipeline for [OpenScan](https://github.com/OpenScan-org/OpenScan3).
 
+## Archive Status
+
+This repository is an experimental prototype for photogrammetry workflows around OpenScan hardware.
+
+It is no longer the intended long-term home for this work. Future development and upstreamable ideas are being tracked in the OpenScan3 project:
+
+- https://github.com/OpenScan-org/OpenScan3/issues/69
+- https://github.com/OpenScan-org/OpenScan3/issues/70
+- https://github.com/OpenScan-org/OpenScan3/issues/71
+- https://github.com/OpenScan-org/OpenScan3/issues/72
+- https://github.com/OpenScan-org/OpenScan3/issues/73
+- https://github.com/OpenScan-org/OpenScan3/issues/74
+- https://github.com/OpenScan-org/OpenScan3/issues/75
+
+This repo remains available as a reference implementation and experiment log.
+
 The active workflow uses the OpenScan3 firmware REST API to:
 - calibrate the camera from checkerboard captures,
 - drive the turntable and rotor from the workstation,
@@ -78,6 +94,8 @@ python src/colmap_reconstruct.py \
     --calibration data/calibration/calibration.json \
     --sparse-only
 ```
+
+Current status: a first calibration solve exists at `data/calibration/calibration.json`, but its RMS reprojection error is `3.6627 px`, so treat it as a validation calibration rather than a final one.
 
 ### Calibration options
 

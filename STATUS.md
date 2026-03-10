@@ -2,7 +2,7 @@
 
 **Last updated:** 2026-03-10
 
-## Current Phase: D — Dense Reconstruction (calibration + validation in progress)
+## Current Phase: D — Dense Reconstruction (calibration measured, reconstruction next)
 
 ### Phase A: Foundation ✅
 - [x] SSH & passwordless auth to Pi
@@ -31,7 +31,7 @@
 - [x] COLMAP feature extraction (9.4–10.8k features/image) ✅
 - [x] Feature matching (120 matches found) ✅
 - [x] **Rotor motor repair** ✅ — elevation gearbox repaired
-- [ ] **Camera calibration** — unblocked; collect checkerboard set and solve intrinsics
+- [ ] **Camera calibration** — first solve completed from 16 guided frames, but quality is weak (RMS 3.6627 px)
 - [ ] **Pose-prior SfM** — firmware capture + pose-prior COLMAP scripts drafted locally; needs end-to-end validation
 - [ ] Full 120-position scan (5 elevations × 24 azimuths)
 - [ ] OpenMVS dense reconstruction + mesh
@@ -47,15 +47,22 @@
 | Blocker | Status | Notes |
 |---------|--------|-------|
 | Rotor gear | Cleared | Elevation gearbox repaired |
-| Camera calibration | Active next step | Needs checkerboard capture at varied distances/tilts |
-| Pose-prior SfM | Pending validation | New local scripts exist but are not documented/committed yet |
+| Camera calibration quality | Open | First solve exists at `data/calibration/calibration.json`, but RMS is 3.6627 px |
+| Pose-prior SfM | Ready for validation | Scripts are committed; next step is a real scan with `--calibration` |
 
 ## Immediate Next Steps
 
-1. Improve the checkerboard set until `data/calibration/calibration.json` reaches an acceptable RMS.
+1. Decide whether to accept the current calibration for a plumbing test or improve it before production scans.
 2. Capture a new multi-elevation grayscale JPEG session via the firmware API pipeline.
-3. Run pose-prior COLMAP sparse reconstruction on that session with `--calibration`.
-4. Validate sparse registration quality, then proceed to dense reconstruction.
+3. Run pose-prior COLMAP sparse reconstruction on that session with `--calibration data/calibration/calibration.json`.
+4. Inspect registered image count and sparse geometry before attempting dense reconstruction.
+
+## Calibration Snapshot (2026-03-10)
+
+- Guided capture accepted 16 checkerboard frames.
+- Calibration file written to `data/calibration/calibration.json`.
+- RMS reprojection error: `3.6627 px`
+- Assessment: usable for pipeline validation, not yet good enough for a final production calibration.
 
 ## Upstream Contributions
 
